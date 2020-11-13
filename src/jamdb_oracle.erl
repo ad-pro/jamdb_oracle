@@ -1,4 +1,5 @@
 -module(jamdb_oracle).
+-vsn("0.4.2").
 -behaviour(gen_server).
 
 -ifdef(OTP_RELEASE).
@@ -43,11 +44,14 @@ init(Opts) ->
                 _ -> {ok, State}
             end;
         {ok, Result, _State} ->
-            {stop, Result}
+            {stop, Result};
+        {error, Type, Result, _State} ->
+            {stop, {Type, Result}}
     end.
 
 %% Error types: socket, remote, local
 handle_call({sql_query, Query}, _From, State) ->
+%% io:format("~p~n", [Query]),
     try jamdb_oracle_conn:sql_query(State, Query) of
         {ok, Result, State2} -> 
             {reply, {ok, Result}, State2};

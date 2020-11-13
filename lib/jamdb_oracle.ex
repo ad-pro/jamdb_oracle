@@ -1,4 +1,5 @@
 defmodule Jamdb.Oracle do
+  @vsn "0.4.3"
   @moduledoc """
   Adapter module for Oracle. `DBConnection` behaviour implementation.
 
@@ -46,15 +47,17 @@ defmodule Jamdb.Oracle do
         {:ok, %{num_rows: length(rows), rows: rows, columns: columns}}
       {:ok, [{:fetched_rows, _, _, _} = result]} -> {:cont, result}
       {:ok, [{:proc_result, 0, rows}]} -> {:ok, %{num_rows: length(rows), rows: rows}}
-      {:ok, [{:proc_result, _, _}] = result} -> {:error, result}
+      {:ok, [{:proc_result, _, msg}]} -> {:error, msg}
       {:ok, [{:affected_rows, num_rows}]} -> {:ok, %{num_rows: num_rows, rows: nil}}
       {:ok, result} -> {:ok, result}
+      {:error, :local, _} -> {:error, "Data is incomplete. Pass :read_timeout as connection parameter."}
       {:error, _, err} -> {:disconnect, err}
     end
   end
 
   defp stmt({:fetch, sql, params}, _), do: {:fetch, sql, params}
   defp stmt({:fetch, cursor, row_format, last_row}, _), do: {:fetch, cursor, row_format, last_row}
+  defp stmt({:batch, sql, params}, _), do: {:batch, sql, params}
   defp stmt(sql, params), do: {sql, params}
   
   @impl true
@@ -83,12 +86,19 @@ defmodule Jamdb.Oracle do
   end
 
   @impl true
+  def handle_execute(%{batch: true} = query, params, _opts, s) do
+    %Jamdb.Oracle.Query{statement: statement} = query
+    case query(s, {:batch, statement |> to_charlist, params}, []) do
+      {:ok, result} -> {:ok, query, result, s}
+      {:error, err} -> {:error, error!(err), s}
+      {:disconnect, err} -> {:disconnect, error!(err), s}
+    end
+  end
   def handle_execute(query, params, opts, s) do
     %Jamdb.Oracle.Query{statement: statement} = query
     returning = Enum.map(Keyword.get(opts, :out, []), fn elem -> {:out, elem} end)
     case query(s, statement |> to_charlist, Enum.concat(params, returning)) do
       {:ok, result} -> {:ok, query, result, s}
-      {:error, [{:proc_result, _, msg}]} -> {:error, error!(msg), s}
       {:error, err} -> {:error, error!(err), s}
       {:disconnect, err} -> {:disconnect, error!(err), s}
     end
@@ -106,7 +116,7 @@ defmodule Jamdb.Oracle do
         statement = "SAVEPOINT tran"
         handle_transaction(statement, opts, %{s | mode: :transaction})
       :savepoint when mode == :transaction ->
-        statement = "SAVEPOINT " ++ Keyword.get(opts, :name, :svpt)
+        statement = "SAVEPOINT " <> Keyword.get(opts, :name, "svpt")
         handle_transaction(statement, opts, %{s | mode: :transaction})
       status when status in [:transaction, :savepoint] ->
         {status, s}
@@ -120,8 +130,7 @@ defmodule Jamdb.Oracle do
         statement = "COMMIT"
         handle_transaction(statement, opts, %{s | mode: :idle})
       :savepoint when mode == :transaction ->
-        statement = "COMMIT"
-        handle_transaction(statement, opts, %{s | mode: :idle})
+        {:ok, [], %{s | mode: :transaction}}
       status when status in [:transaction, :savepoint] ->
         {status, s}
     end
@@ -134,7 +143,7 @@ defmodule Jamdb.Oracle do
         statement = "ROLLBACK TO tran"
         handle_transaction(statement, opts, %{s | mode: :idle})
       :savepoint when mode in [:transaction, :error] ->
-        statement = "ROLLBACK TO " ++ Keyword.get(opts, :name, :svpt)
+        statement = "ROLLBACK TO " <> Keyword.get(opts, :name, "svpt")
         handle_transaction(statement, opts, %{s | mode: :transaction})
       status when status in [:transaction, :savepoint] ->
         {status, s}
@@ -215,6 +224,7 @@ defmodule Jamdb.Oracle do
     case query(s, 'PING') do
       {:ok, _} -> {:ok, s}
       {:error, err} -> {:disconnect, error!(err), s}
+      {:disconnect, err} -> {:disconnect, error!(err), s}
     end
   end
   def ping(%{mode: :transaction} = s) do
@@ -223,6 +233,20 @@ defmodule Jamdb.Oracle do
 
   defp error!(msg) do
     DBConnection.ConnectionError.exception("#{inspect msg}")
+  end
+
+  @doc """
+  Returns the configured JSON library.
+
+  To customize the JSON library, include the following in your `config/config.exs`:
+
+      config :jamdb_oracle, :json_library, SomeJSONModule
+
+  Defaults to [`Jason`](https://hexdocs.pm/jason)
+  """
+  @spec json_library() :: module()
+  def json_library() do
+    Application.get_env(:jamdb_oracle, :json_library, Jason)
   end
 
 end
@@ -243,25 +267,36 @@ defimpl DBConnection.Query, for: Jamdb.Oracle.Query do
   defp decode(:null), do: nil
   defp decode({elem}) when is_number(elem), do: elem
   defp decode({date, time}) when is_tuple(date), do: to_naive({date, time})
+  defp decode({date, time, tz}) when is_tuple(date) and is_list(tz), do: to_date({date, time, tz})
   defp decode({date, time, _}) when is_tuple(date), do: to_utc({date, time})
   defp decode(elem) when is_list(elem), do: to_binary(elem)
   defp decode(elem), do: elem
 
   def encode(_, [], _), do: []
-  def encode(_, params, opts) do 
-    charset = if( Keyword.has_key?(opts, :charset) == true, 
-      do: Enum.member?(["al16utf16","ja16euc","zhs16gbk","zht16big5","zht16mswin950"],
-        opts[:charset]), else: false )
-    Enum.map(params, fn elem -> encode(elem, charset) end)
+  def encode(_, params, opts) do
+    types = Enum.map(Keyword.get(opts, :in, []), fn elem -> elem end)
+    Enum.map(encode(params, types), fn elem -> encode(elem) end)
   end
 
-  defp encode(nil, _), do: :null
-  defp encode(%Decimal{} = decimal, _), do: Decimal.to_float(decimal)
-  defp encode(%DateTime{} = datetime, _), do: NaiveDateTime.to_erl(DateTime.to_naive(datetime))
-  defp encode(%NaiveDateTime{} = naive, _), do: NaiveDateTime.to_erl(naive)
-  defp encode(%Ecto.Query.Tagged{value: elem}, _), do: elem
-  defp encode(elem, false) when is_binary(elem), do: elem |> to_charlist
-  defp encode(elem, _), do: elem
+  defp encode(params, []), do: params
+  defp encode([%Ecto.Query.Tagged{type: :binary} = elem | next1], [_type | next2]),
+    do: [ elem | encode(next1, next2)]
+  defp encode([elem | next1], [type | next2]) when type in [:binary, :binary_id, Ecto.UUID],
+    do: [ %Ecto.Query.Tagged{value: elem, type: :binary} | encode(next1, next2)]
+  defp encode([elem | next1], [_type | next2]), do: [ elem | encode(next1, next2)]
+
+  defp encode(nil), do: :null
+  defp encode(true), do: "1"
+  defp encode(false), do: "0"
+  defp encode(%Decimal{} = decimal), do: Decimal.to_float(decimal)
+  defp encode(%DateTime{} = datetime), do: NaiveDateTime.to_erl(DateTime.to_naive(datetime))
+  defp encode(%NaiveDateTime{} = naive), do: NaiveDateTime.to_erl(naive)
+  defp encode(%Date{} = date), do: Date.to_erl(date)
+  defp encode(%Ecto.Query.Tagged{value: elem, type: :binary}) when is_binary(elem), do: elem
+  defp encode(elem) when is_binary(elem), do: elem |> to_charlist
+  defp encode(elem) when is_map(elem),
+    do: encode(Jamdb.Oracle.json_library().encode!(elem))
+  defp encode(elem), do: elem
 
   defp expr(list) when is_list(list) do
     Enum.map(list, fn 
@@ -289,6 +324,11 @@ defimpl DBConnection.Query, for: Jamdb.Oracle.Query do
 
   defp to_utc({date, time}),
     do: DateTime.from_naive!(to_naive({date, time}), "Etc/UTC")
+
+  defp to_date({{year, month, day}, {hour, min, sec}, tz}),
+    do: %DateTime{year: year, month: month, day: day, hour: hour, minute: min,
+	second: trunc(sec), microsecond: parse_sec(sec), time_zone: to_binary(tz),
+	zone_abbr: "UTC", utc_offset: 0, std_offset: 0}
 
   defp parse_sec(sec),
     do: {trunc((sec - trunc(sec)) * 1000000) , 6}

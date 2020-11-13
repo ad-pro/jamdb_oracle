@@ -2,6 +2,8 @@ JamDB Oracle
 ============
 Erlang driver and Ecto adapter for Oracle Database
 
+[![hex downloads](https://img.shields.io/hexpm/dt/jamdb_oracle?label=hex%20downloads)](https://hex.pm/packages/jamdb_oracle)
+
 Features
 =====
 
@@ -54,8 +56,6 @@ First, supply connection details for your test database in test/jamdb_oracle_tes
 
 Author
 ======
- [![Donate Bitcoin](https://img.shields.io/badge/donate-bitcoin-yellow.svg)](https://www.blockchain.com/btc/payment_request?address=1Am6cPsSMZLwHQbQ5AXQQhpSMMoxgRHQit)
- 
 Mykhailo Vstavskyi
 
 Contributors

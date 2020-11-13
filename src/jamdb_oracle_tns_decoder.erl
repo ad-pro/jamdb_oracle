@@ -3,7 +3,7 @@
 %% API
 -export([decode_packet/2]).
 -export([decode_token/2]).
--export([decode_helper/2]).
+-export([decode_helper/3]).
 
 -include("jamdb_oracle.hrl").
 
@@ -60,15 +60,17 @@ decode_token(net, {Data, EnvOpts}) ->
 decode_token(rpa, Data) ->
     Num = decode_ub4(Data),
     Values = decode_keyval(decode_next(Data), Num, []),
-    SessKey = proplists:get_value("AUTH_SESSKEY", Values),
-    Salt = proplists:get_value("AUTH_VFR_DATA", Values),
-    DerivedSalt = proplists:get_value("AUTH_PBKDF2_CSK_SALT", Values),
-    case proplists:get_value("AUTH_SVR_RESPONSE", Values) of
+    SessKey = get_value("AUTH_SESSKEY", Values),
+    Salt = get_value("AUTH_VFR_DATA", Values),
+    Type = get_value("AUTH_VFR_DATA", Values, 3),
+    DerivedSalt = get_value("AUTH_PBKDF2_CSK_SALT", Values),
+    Logon = #logon{type=Type, auth=SessKey, salt=Salt, der_salt=DerivedSalt},
+    case get_value("AUTH_SVR_RESPONSE", Values) of
         undefined ->
-            {?TTI_SESS, SessKey, Salt, DerivedSalt};
+            {?TTI_SESS, Logon};
         Resp ->
-            Value = proplists:get_value("AUTH_VERSION_NO", Values),
-	    SessId = proplists:get_value("AUTH_SESSION_ID", Values),
+            Value = get_value("AUTH_VERSION_NO", Values),
+            SessId = get_value("AUTH_SESSION_ID", Values),
             Ver = decode_version(Value),
             {?TTI_AUTH, Resp, Ver, SessId}
     end;
@@ -92,9 +94,10 @@ decode_token(oac, Data) ->
     {Rest13, DataType, Length, Scale, Charset};
 decode_token(wrn, Data) ->
     Rest2 = decode_next(ub2,Data),	%%retCode
+    Length = decode_ub2(Rest2),
     Rest3 = decode_next(ub2,Rest2),	%%warnLength
     Rest4 = decode_next(ub2,Rest3),	%%warnFlag
-    decode_next(chr, Rest4).            %%errorMsg
+    decode_next(ub1, Rest4, Length).    %%warnMsg
 
 decode_token(dcb, Data, {Ver, _RowFormat, Type}) when is_atom(Type) ->
     {Rest2, RowFormat} = decode_token(dcb, decode_next(Data), Ver),
@@ -387,8 +390,13 @@ decode_data(Data, Values, {DefCol, [ValueFormat|RestRowFormat], Ver, Type=block}
 decode_data(Data, _ValueFormat, Values, 0, _Type) ->
     {lists:reverse(Values), Data};
 decode_data(Data, ValueFormat, Values, Num, Type) ->
-    {Value, RestData} = decode_data(Data, ValueFormat),
-    decode_data(decode_next(ub2,RestData), ValueFormat, [Value|Values], Num-1, Type).    
+    {Value, RestData} = decode_data(Data, ValueFormat, Num, Type),
+    decode_data(decode_next(ub2,RestData), ValueFormat, [Value|Values], Num-1, Type).
+
+decode_data(Bin, #format{data_type=DataType}, _Num, Type=return) when ?IS_LONG_TYPE(DataType) ->
+    decode_long(Bin, Type);
+decode_data(Bin, DataType, _Num, _Type) ->
+    decode_data(Bin, DataType).
 
 decode_data(Data, #format{data_type=DataType, data_length=0}) when ?IS_NULL_TYPE(DataType) ->
     {null, Data};
@@ -406,10 +414,15 @@ decode_data(Data, #format{data_type=DataType, data_scale=Scale}) when ?IS_NUMBER
 decode_data(Data, #format{data_type=DataType}) when ?IS_FIXED_TYPE(DataType) ->
     <<Length, Bin:Length/binary, Rest/binary>> = Data,
     {decode_value(Bin, DataType), Rest};
+decode_data(Data, #format{data_type=?TNS_TYPE_REFCURSOR}) ->
+    {_DefCol, Rest2} = decode_token(rxd, Data, {0, [], fetch}),
+    {null, decode_next(ub1,Rest2)};
 decode_data(Data, #format{data_type=DataType}) ->
     decode_value(Data, DataType).
 
-decode_value(Bin, DataType) when ?IS_CHAR_TYPE(DataType); ?IS_RAW_TYPE(DataType) ->
+decode_value(Bin, DataType) when ?IS_CHAR_TYPE(DataType) ->
+    decode_chr(Bin);
+decode_value(Bin, DataType) when ?IS_RAW_TYPE(DataType) ->
     decode_chr(Bin);
 decode_value(Bin, DataType) when ?IS_NUMBER_TYPE(DataType) ->
     {decode_number(Bin)};
@@ -450,7 +463,7 @@ decode_param({_Data, ValueFormat}) ->
 %        L when DataType =:= ?TNS_TYPE_DATE -> 7;
 %        L when DataType =:= ?TNS_TYPE_TIMESTAMPTZ -> 13;
 %        L -> L
-%    end.      
+%    end.
 
 decode_keyval(_Data,0,Acc) ->
     Acc;
@@ -469,8 +482,9 @@ decode_keyval(Data,Num,Acc) ->
 	    Rest5 = decode_next(Rest2),
 	    {decode_chr(Rest5), decode_next(chr,Rest5)}
     end,
+    NbPair = decode_ub4(Rest4),
     Rest6 = decode_next(Rest4),
-    decode_keyval(Rest6,Num-1,[{Key,Value}|Acc]).
+    decode_keyval(Rest6,Num-1,[{Key,Value,NbPair}|Acc]).
 
 decode_ub1(<<Data:8,_Rest/bits>>) ->
     Data.
@@ -566,11 +580,13 @@ decode_date(<<Data:11/binary,H,M>>) ->
         0 -> ltz(H - 20);
         _ ->
             Zoneid = ((H band 127) bsl 6) + ((M band 252) bsr 2),
-            try lists:nth(Zoneid,
-            [0,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,1,2,3,4,5,6,7,8,9,10,11,12]) of
+            try lists:nth(Zoneid, [0,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1,1,2,3,4,5,6,7,8,9,10,11,12]) of
                 Hour -> ltz(Hour)
             catch
-                error:_ -> proplists:get_value(Zoneid, ?ZONEIDMAP, {Zoneid})
+		error:_ -> case proplists:get_value(Zoneid, ?ZONEIDMAP) of
+                               undefined -> {Zoneid};
+		               {Region, Zone} -> lists:nth(Region, ?REGION)++"/"++Zone
+                           end
             end
     end).
 
@@ -598,6 +614,13 @@ last([E|Es]) -> last(E, Es).
 
 last(_, [E|Es]) -> last(E, Es);
 last(E, []) -> E.
+
+get_value(Key, L) -> get_value(Key, L, 2).
+
+get_value(_Key, [], _N) ->
+    undefined;
+get_value(Key, [P | Ps], N) ->
+    if element(1, P) =:= Key -> element(N, P); true -> get_value(Key, Ps, N) end.
 
 %decode_version(I) when is_integer(I) ->
 %    {(I band 4278190080) bsr 24 band 255, (I band 15728640) bsr 20 band 255,
@@ -630,7 +653,7 @@ decode_urowid(Data) ->
             {lid(Objid,Partid,Blocknum,Slotnum),Rest3};
         _ -> {Value, Rest3}
     end.
-    
+
 lid(O,P,B,S) -> lid(O,6,[])++lid(P,3,[])++lid(B,6,[])++lid(S,3,[]).
 
 lid(_N,0,Acc) -> Acc;
@@ -708,6 +731,12 @@ decode_adt(Data, Num, Acc) ->
 lrd(<<I,F,S,T,L, Rest/bits>>) when I > 245 -> {(F+S+T) * 256 + L, Rest};
 lrd(<<L, Rest/bits>>) -> {L, Rest}.
 
+decode_long(<<0, Rest/bits>>, _Type) ->
+    {null, Rest};
+decode_long(Data, _Type) ->
+    Value = decode_chr(Data),
+    {Value, decode_next(chr,Data)}.
+
 decode_long(<<0, Rest/bits>>) ->
     {null, decode_next(ub2,Rest,2)};
 decode_long(Data) ->
@@ -715,5 +744,5 @@ decode_long(Data) ->
     Rest2 = decode_next(chr,Data),
     {Value, decode_next(ub2,Rest2,2)}.
 
-decode_helper(param, Data) -> decode_token(oac, ?ENCODER:encode_token(oac, Data));
-decode_helper(tz, Data) -> ltz(Data).
+decode_helper(param, Data, Format) -> decode_token(oac, ?ENCODER:encode_token(oac, Data, Format));
+decode_helper(tz, Data, _) -> ltz(Data).
